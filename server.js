@@ -154,6 +154,26 @@ app.post('/webhooks/cal', handleCalWebhook);
 // Alias for tools pointed to the base ngrok URL (POST /)
 app.post('/', handleCalWebhook);
 
+// HubSpot MCP inspector (and OAuth) open the redirect URL with GET ?code=...
+// This app only implements POST webhooks; respond 200 so the browser is not a hard error.
+app.get('/', (req, res) => {
+  const lines = [
+    'Webhook server is up.',
+    '',
+    'HubSpot webhooks (POST JSON + signatures): POST /webhooks/hubspot',
+    'Cal.com (POST): /webhooks/cal or POST /',
+    'Resend (POST): /webhooks/resend'
+  ];
+  if (req.query.code) {
+    lines.unshift(
+      'Received OAuth ?code= on GET /. This project does not exchange that code for tokens.',
+      'For MCP inspector: use a redirect URL meant for OAuth, or test CRM webhooks against POST /webhooks/hubspot.',
+      ''
+    );
+  }
+  res.status(200).type('text/plain').send(lines.join('\n'));
+});
+
 // --- HubSpot webhook signature helpers (v1 CRM, v2 workflows/cards, v3 OAuth) ---
 // https://developers.hubspot.com/docs/api/webhooks/validating-requests
 
