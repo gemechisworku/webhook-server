@@ -154,6 +154,141 @@ app.post('/webhooks/cal', handleCalWebhook);
 // Alias for tools pointed to the base ngrok URL (POST /)
 app.post('/', handleCalWebhook);
 
+// --- HubSpot webhook signature helpers (v1 CRM, v2 workflows/cards, v3 OAuth) ---
+// https://developers.hubspot.com/docs/api/webhooks/validating-requests
+
+function buildHubSpotRequestUri(req) {
+  const proto = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+  const host = (req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim();
+  return `${proto}://${host}${req.originalUrl || ''}`;
+}
+
+function decodeHubSpotV3Uri(uri) {
+  const replacements = [
+    ['%3A', ':'],
+    ['%2F', '/'],
+    ['%3F', '?'],
+    ['%40', '@'],
+    ['%21', '!'],
+    ['%24', '$'],
+    ["%27", "'"],
+    ['%28', '('],
+    ['%29', ')'],
+    ['%2A', '*'],
+    ['%2C', ','],
+    ['%3B', ';']
+  ];
+  let out = uri;
+  for (const [enc, dec] of replacements) {
+    const upper = enc.toUpperCase();
+    const lower = enc.toLowerCase();
+    out = out.split(upper).join(dec).split(lower).join(dec);
+  }
+  return out;
+}
+
+function timingSafeEqualHexOrAscii(a, b) {
+  const ba = Buffer.from(String(a), 'utf8');
+  const bb = Buffer.from(String(b), 'utf8');
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+function verifyHubSpotV1(clientSecret, rawBody, receivedSignature) {
+  const source = `${clientSecret}${rawBody}`;
+  const expected = crypto.createHash('sha256').update(source, 'utf8').digest('hex');
+  return timingSafeEqualHexOrAscii(expected.toLowerCase(), String(receivedSignature).toLowerCase());
+}
+
+function verifyHubSpotV2(clientSecret, method, requestUri, rawBody, receivedSignature) {
+  const m = String(method).toUpperCase();
+  const source = `${clientSecret}${m}${requestUri}${rawBody}`;
+  const expected = crypto.createHash('sha256').update(source, 'utf8').digest('hex');
+  return timingSafeEqualHexOrAscii(expected.toLowerCase(), String(receivedSignature).toLowerCase());
+}
+
+function verifyHubSpotV3(clientSecret, method, requestUri, rawBody, timestampMs, receivedSignature) {
+  const ts = Number(timestampMs);
+  if (!Number.isFinite(ts)) return false;
+  const now = Date.now();
+  if (Math.abs(now - ts) > 300000) return false;
+
+  const m = String(method).toUpperCase();
+  const uri = decodeHubSpotV3Uri(requestUri);
+  const rawString = `${m}${uri}${rawBody}${timestampMs}`;
+  const expected = crypto.createHmac('sha256', clientSecret).update(rawString, 'utf8').digest('base64');
+  const recv = String(receivedSignature).trim();
+  const be = Buffer.from(expected, 'utf8');
+  const br = Buffer.from(recv, 'utf8');
+  if (be.length !== br.length) return false;
+  return crypto.timingSafeEqual(be, br);
+}
+
+function verifyHubSpotRequest(req, clientSecret) {
+  const rawBody = req.rawBody ? req.rawBody.toString('utf8') : '';
+  const requestUri = buildHubSpotRequestUri(req);
+  const sigV3 = req.headers['x-hubspot-signature-v3'];
+  const tsV3 = req.headers['x-hubspot-request-timestamp'];
+  const sig = req.headers['x-hubspot-signature'];
+  const sigVersion = (req.headers['x-hubspot-signature-version'] || '').toLowerCase();
+
+  if (sigV3) {
+    return verifyHubSpotV3(clientSecret, req.method, requestUri, rawBody, tsV3, sigV3);
+  }
+  if (sigVersion === 'v2' && sig) {
+    return verifyHubSpotV2(clientSecret, req.method, requestUri, rawBody, sig);
+  }
+  if (sigVersion === 'v1' && sig) {
+    return verifyHubSpotV1(clientSecret, rawBody, sig);
+  }
+  if (sig && !sigVersion) {
+    return (
+      verifyHubSpotV2(clientSecret, req.method, requestUri, rawBody, sig) ||
+      verifyHubSpotV1(clientSecret, rawBody, sig)
+    );
+  }
+  return false;
+}
+
+// 4. HubSpot (CRM subscriptions, workflow webhooks, etc.)
+app.post('/webhooks/hubspot', (req, res) => {
+  const secret = process.env.HUBSPOT_CLIENT_SECRET;
+  const receivedAt = new Date().toISOString();
+
+  if (!secret) {
+    logWebhook('HUBSPOT_CONFIG_ERROR', {
+      receivedAt,
+      error: 'Missing HUBSPOT_CLIENT_SECRET'
+    });
+    return res.status(500).send('Missing HUBSPOT_CLIENT_SECRET');
+  }
+
+  const ok = verifyHubSpotRequest(req, secret);
+  const body = req.body;
+
+  if (ok) {
+    logWebhook('HUBSPOT_VERIFIED', {
+      receivedAt,
+      signatureVersion: req.headers['x-hubspot-signature-version'] || (req.headers['x-hubspot-signature-v3'] ? 'v3' : undefined),
+      eventCount: Array.isArray(body) ? body.length : body != null ? 1 : 0,
+      subscriptionTypes: Array.isArray(body)
+        ? [...new Set(body.map((e) => e && e.subscriptionType).filter(Boolean))]
+        : undefined,
+      portalId: Array.isArray(body) ? body[0]?.portalId : body?.portalId
+    });
+    return res.status(200).send('OK');
+  }
+
+  logWebhook('HUBSPOT_VERIFY_FAILED', {
+    receivedAt,
+    error: 'Signature verification failed',
+    hasV3: Boolean(req.headers['x-hubspot-signature-v3']),
+    signatureVersion: req.headers['x-hubspot-signature-version'],
+    bodyPreview: (req.rawBody ? req.rawBody.toString('utf8') : '').slice(0, 300)
+  });
+  return res.status(401).send('Unauthorized');
+});
+
 // 3. Africa's Talking (SMS/Voice Callback)
 app.post('/webhooks/africastalking', (req, res) => {
   // AT sends data as form-urlencoded
