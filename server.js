@@ -182,6 +182,7 @@ app.get('/', async (req, res) => {
           'Set in your environment (e.g. Render env vars):',
           '  HUBSPOT_CLIENT_ID      — from the app Auth / settings page',
           '  HUBSPOT_CLIENT_SECRET  — same secret you use for webhook signatures',
+          '  HUBSPOT_CODE_VERIFIER  — PKCE verifier (same value used to build the install / authorize URL); required for MCP OAuth 2.1',
           'Optional:',
           '  HUBSPOT_REDIRECT_URI   — must match the redirect URL registered in HubSpot exactly',
           `  (if omitted, using: ${redirectUri})`,
@@ -191,15 +192,34 @@ app.get('/', async (req, res) => {
       );
     }
 
+    const codeVerifier = process.env.HUBSPOT_CODE_VERIFIER;
+    if (!codeVerifier || !String(codeVerifier).trim()) {
+      return res.status(200).type('text/plain').send(
+        [
+          'HubSpot sent an authorization code, but PKCE code_verifier is not configured.',
+          'MCP / OAuth 2.1 flows require the same code_verifier used when generating code_challenge for the authorize URL.',
+          '',
+          'Set HUBSPOT_CODE_VERIFIER on the server (e.g. Render) to the exact verifier string, then run the OAuth / MCP flow again.',
+          '',
+          'Docs: https://developers.hubspot.com/docs/apps/developer-platform/build-apps/integrate-with-the-remote-hubspot-mcp-server',
+          '',
+          'Webhook endpoint (POST): /webhooks/hubspot'
+        ].join('\n')
+      );
+    }
+
     try {
+      const tokenUrl =
+        process.env.HUBSPOT_OAUTH_TOKEN_URL || 'https://api.hubspot.com/oauth/2026-03/token';
       const params = new URLSearchParams({
         grant_type: 'authorization_code',
         client_id: clientId,
         client_secret: clientSecret,
         redirect_uri: redirectUri,
-        code: String(code)
+        code: String(code),
+        code_verifier: String(codeVerifier).trim()
       });
-      const tokenRes = await fetch('https://api.hubapi.com/oauth/v1/token', {
+      const tokenRes = await fetch(tokenUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: params.toString()
@@ -222,7 +242,9 @@ app.get('/', async (req, res) => {
             `HubSpot token exchange failed (HTTP ${tokenRes.status}).`,
             typeof data === 'object' ? JSON.stringify(data, null, 2) : String(data),
             '',
-            'Common fix: set HUBSPOT_REDIRECT_URI to the exact redirect URL configured on your HubSpot app (trailing slash and scheme must match).',
+            'Common fixes:',
+            '  • HUBSPOT_REDIRECT_URI must match the redirect URL on your HubSpot app exactly.',
+            '  • HUBSPOT_CODE_VERIFIER must match the verifier used for the authorize URL (PKCE / MCP).',
             `Currently using redirect_uri: ${redirectUri}`
           ].join('\n')
         );
@@ -267,7 +289,7 @@ app.get('/', async (req, res) => {
     [
       'Webhook server is up.',
       '',
-      'HubSpot OAuth callback: GET /?code=... (exchange uses HUBSPOT_CLIENT_ID, HUBSPOT_CLIENT_SECRET, optional HUBSPOT_REDIRECT_URI)',
+      'HubSpot OAuth callback: GET /?code=... (HUBSPOT_CLIENT_ID, HUBSPOT_CLIENT_SECRET, HUBSPOT_CODE_VERIFIER for PKCE/MCP, optional HUBSPOT_REDIRECT_URI; token URL default https://api.hubspot.com/oauth/2026-03/token)',
       'HubSpot webhooks (POST): /webhooks/hubspot',
       'Cal.com (POST): /webhooks/cal or POST /',
       'Resend (POST): /webhooks/resend'
