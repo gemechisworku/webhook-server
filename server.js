@@ -154,24 +154,125 @@ app.post('/webhooks/cal', handleCalWebhook);
 // Alias for tools pointed to the base ngrok URL (POST /)
 app.post('/', handleCalWebhook);
 
-// HubSpot MCP inspector (and OAuth) open the redirect URL with GET ?code=...
-// This app only implements POST webhooks; respond 200 so the browser is not a hard error.
-app.get('/', (req, res) => {
-  const lines = [
-    'Webhook server is up.',
-    '',
-    'HubSpot webhooks (POST JSON + signatures): POST /webhooks/hubspot',
-    'Cal.com (POST): /webhooks/cal or POST /',
-    'Resend (POST): /webhooks/resend'
-  ];
-  if (req.query.code) {
-    lines.unshift(
-      'Received OAuth ?code= on GET /. This project does not exchange that code for tokens.',
-      'For MCP inspector: use a redirect URL meant for OAuth, or test CRM webhooks against POST /webhooks/hubspot.',
-      ''
-    );
+function firstQueryParam(val) {
+  if (val == null) return undefined;
+  return Array.isArray(val) ? val[0] : val;
+}
+
+// HubSpot MCP inspector completes OAuth with GET /?code=... (and optional ?state=...)
+app.get('/', async (req, res) => {
+  const oauthError = firstQueryParam(req.query.error);
+  if (oauthError) {
+    const desc = firstQueryParam(req.query.error_description);
+    return res.status(200).type('text/plain').send(`HubSpot OAuth was not completed.\n${oauthError}${desc ? `\n${desc}` : ''}`);
   }
-  res.status(200).type('text/plain').send(lines.join('\n'));
+
+  const code = firstQueryParam(req.query.code);
+  if (code) {
+    const clientId = process.env.HUBSPOT_CLIENT_ID;
+    const clientSecret = process.env.HUBSPOT_CLIENT_SECRET;
+    const proto = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+    const host = (req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim();
+    const redirectUri = process.env.HUBSPOT_REDIRECT_URI || `${proto}://${host}/`;
+
+    if (!clientId || !clientSecret) {
+      return res.status(200).type('text/plain').send(
+        [
+          'HubSpot sent an authorization code, but this server cannot exchange it yet.',
+          'Set in your environment (e.g. Render env vars):',
+          '  HUBSPOT_CLIENT_ID      — from the app Auth / settings page',
+          '  HUBSPOT_CLIENT_SECRET  — same secret you use for webhook signatures',
+          'Optional:',
+          '  HUBSPOT_REDIRECT_URI   — must match the redirect URL registered in HubSpot exactly',
+          `  (if omitted, using: ${redirectUri})`,
+          '',
+          'Webhook endpoint (POST): /webhooks/hubspot'
+        ].join('\n')
+      );
+    }
+
+    try {
+      const params = new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: redirectUri,
+        code: String(code)
+      });
+      const tokenRes = await fetch('https://api.hubapi.com/oauth/v1/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString()
+      });
+      const rawText = await tokenRes.text();
+      let data;
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        data = { message: rawText };
+      }
+
+      if (!tokenRes.ok) {
+        logWebhook('HUBSPOT_OAUTH_TOKEN_FAILED', {
+          status: tokenRes.status,
+          hubspot: typeof data === 'object' ? data : { message: String(data) }
+        });
+        return res.status(200).type('text/plain').send(
+          [
+            `HubSpot token exchange failed (HTTP ${tokenRes.status}).`,
+            typeof data === 'object' ? JSON.stringify(data, null, 2) : String(data),
+            '',
+            'Common fix: set HUBSPOT_REDIRECT_URI to the exact redirect URL configured on your HubSpot app (trailing slash and scheme must match).',
+            `Currently using redirect_uri: ${redirectUri}`
+          ].join('\n')
+        );
+      }
+
+      logWebhook('HUBSPOT_OAUTH_TOKEN_OK', {
+        expiresIn: data.expires_in,
+        tokenType: data.token_type,
+        hasRefreshToken: Boolean(data.refresh_token)
+      });
+
+      const showTokens = process.env.HUBSPOT_OAUTH_SHOW_TOKENS === '1';
+      const lines = [
+        'HubSpot OAuth succeeded. Tokens were issued.',
+        `expires_in (seconds): ${data.expires_in ?? 'n/a'}`,
+        ''
+      ];
+      if (showTokens) {
+        lines.push(
+          'HUBSPOT_OAUTH_SHOW_TOKENS=1 is set — remove it after you copy tokens.',
+          '',
+          `access_token:\n${data.access_token ?? ''}`,
+          '',
+          `refresh_token:\n${data.refresh_token ?? ''}`
+        );
+      } else {
+        lines.push(
+          'Tokens are not shown in the page by default.',
+          'Set HUBSPOT_OAUTH_SHOW_TOKENS=1 temporarily to print access_token and refresh_token here, then unset it.',
+          'Or read tokens from MCP inspector if it displays them after redirect.'
+        );
+      }
+      lines.push('', 'Webhook endpoint (POST): /webhooks/hubspot');
+      return res.status(200).type('text/plain').send(lines.join('\n'));
+    } catch (err) {
+      logWebhook('HUBSPOT_OAUTH_ERROR', { error: err.message });
+      return res.status(500).type('text/plain').send(`OAuth exchange error: ${err.message}`);
+    }
+  }
+
+  res.status(200).type('text/plain').send(
+    [
+      'Webhook server is up.',
+      '',
+      'HubSpot OAuth callback: GET /?code=... (exchange uses HUBSPOT_CLIENT_ID, HUBSPOT_CLIENT_SECRET, optional HUBSPOT_REDIRECT_URI)',
+      'HubSpot webhooks (POST): /webhooks/hubspot',
+      'Cal.com (POST): /webhooks/cal or POST /',
+      'Resend (POST): /webhooks/resend'
+    ].join('\n')
+  );
 });
 
 // --- HubSpot webhook signature helpers (v1 CRM, v2 workflows/cards, v3 OAuth) ---
