@@ -5,6 +5,7 @@ const { Webhook } = require('svix');
 require('dotenv').config();
 
 const app = express();
+const RESEND_API_BASE_URL = process.env.RESEND_API_BASE_URL || 'https://api.resend.com';
 
 function getRequestMeta(req) {
   return {
@@ -19,6 +20,76 @@ function getRequestMeta(req) {
 
 function logWebhook(label, details) {
   console.log(`[${label}] ${JSON.stringify(details, null, 2)}`);
+}
+
+function previewText(value, maxLength = 300) {
+  if (typeof value !== 'string') return undefined;
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength)}...`;
+}
+
+async function fetchReceivedEmailContent(emailId, context) {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    logWebhook('RESEND_RECEIVED_FETCH_SKIPPED', {
+      ...context,
+      emailId,
+      reason: 'Missing RESEND_API_KEY'
+    });
+    return;
+  }
+
+  const requestUrl = `${RESEND_API_BASE_URL}/emails/receiving/${encodeURIComponent(emailId)}`;
+
+  try {
+    const response = await fetch(requestUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${apiKey}`
+      }
+    });
+
+    const rawResponse = await response.text();
+    let parsed;
+    try {
+      parsed = rawResponse ? JSON.parse(rawResponse) : undefined;
+    } catch (_parseErr) {
+      parsed = undefined;
+    }
+
+    if (!response.ok) {
+      logWebhook('RESEND_RECEIVED_FETCH_FAILED', {
+        ...context,
+        emailId,
+        status: response.status,
+        statusText: response.statusText,
+        responsePreview: previewText(rawResponse)
+      });
+      return;
+    }
+
+    const email = parsed?.data || parsed || {};
+    logWebhook('RESEND_RECEIVED_CONTENT', {
+      ...context,
+      emailId,
+      messageId: email.message_id,
+      from: email.from,
+      to: email.to,
+      subject: email.subject,
+      hasHtml: Boolean(email.html),
+      hasText: Boolean(email.text),
+      hasHeaders: Boolean(email.headers),
+      attachmentCount: Array.isArray(email.attachments) ? email.attachments.length : undefined,
+      htmlPreview: previewText(email.html),
+      textPreview: previewText(email.text)
+    });
+  } catch (err) {
+    logWebhook('RESEND_RECEIVED_FETCH_FAILED', {
+      ...context,
+      emailId,
+      error: err.message
+    });
+  }
 }
 
 // Basic request/response logging for all incoming calls
@@ -52,7 +123,7 @@ app.use(express.json({
 app.post('/webhooks/resend', (req, res) => {
   const secret = process.env.RESEND_WEBHOOK_SECRET;
   const headers = req.headers;
-  const payload = req.rawBody.toString();
+  const payload = req.rawBody ? req.rawBody.toString() : JSON.stringify(req.body || {});
   const receivedAt = new Date().toISOString();
 
   try {
@@ -68,7 +139,26 @@ app.post('/webhooks/resend', (req, res) => {
       subject: evt.data?.subject,
       createdAt: evt.created_at || evt.data?.created_at
     });
+
+    // Ack quickly, then fetch full inbound content in the background when available.
     res.status(200).send('Verified');
+
+    if (evt.type === 'email.received') {
+      const emailId = evt.data?.email_id;
+      if (!emailId) {
+        logWebhook('RESEND_RECEIVED_FETCH_SKIPPED', {
+          receivedAt,
+          eventType: evt.type,
+          reason: 'Missing email_id in webhook payload'
+        });
+        return;
+      }
+
+      void fetchReceivedEmailContent(emailId, {
+        receivedAt,
+        eventType: evt.type
+      });
+    }
   } catch (err) {
     logWebhook('RESEND_VERIFY_FAILED', {
       receivedAt,
